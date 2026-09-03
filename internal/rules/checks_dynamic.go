@@ -24,12 +24,6 @@ const canaryJS = `(function(){
   return 1;
 })()`
 
-var trackerHosts = []string{
-	"googletagmanager.com", "google-analytics.com", "analytics.google.com",
-	"stats.g.doubleclick.net", "connect.facebook.net", "px.ads.linkedin.com",
-	"cdn.segment.com", "static.hotjar.com",
-}
-
 type netObs struct {
 	mu        sync.Mutex
 	requested map[string]bool
@@ -78,7 +72,10 @@ func browse(parent context.Context, chromePath, url, inject string, settle time.
 	defer cancelA()
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	defer cancel()
-	ctx, cancelT := context.WithTimeout(ctx, 30*time.Second)
+	// Safety cap on a headless run (a hung browser must not wedge the check). 45s
+	// matches the CLI's default per-check budget and leaves headroom for a cold
+	// Chrome start under load / the race detector on CI, where 30s could flake.
+	ctx, cancelT := context.WithTimeout(ctx, 45*time.Second)
 	defer cancelT()
 
 	obs := newObs()
@@ -133,7 +130,7 @@ func offlineProofVerdict(self string, responded []string) Outcome {
 	if len(third) > 0 {
 		return bad("third-party responses from: "+strings.Join(uniq(third), ", "), "no third-party network during load")
 	}
-	return okay("only first-party responses observed", "")
+	return okay("no third-party responses observed during load", "")
 }
 
 // AG-PRV-02: no tracker beacons fire before any consent interaction.
@@ -148,10 +145,14 @@ func chkPreConsentEgress(ctx context.Context, c *CheckCtx) Outcome {
 	return preConsentVerdict(obs.requestedHosts())
 }
 
-// preConsentVerdict fails if any requested host is a known tracker.
+// preConsentVerdict fails if the first-visit (no-consent) load contacted any
+// known third-party analytics/tracker host. The catalog (analyticsHosts) is
+// shared with AG-PRV-01; expanding it from the original 8-host list is the RUN-03
+// fix — a request is an actual egress, so host-matching here carries no
+// false-positive risk (unlike static substring scans of the HTML body).
 func preConsentVerdict(requested []string) Outcome {
 	for _, h := range requested {
-		if t, hit := hostSuffixIn(h, trackerHosts); hit {
+		if t, hit := isAnalyticsHost(h); hit {
 			return bad("tracker contacted pre-consent: "+t, "no analytics/tracker egress before consent")
 		}
 	}
@@ -199,7 +200,10 @@ func browseEval(parent context.Context, chromePath, url, js string, settle time.
 	defer cancelA()
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	defer cancel()
-	ctx, cancelT := context.WithTimeout(ctx, 30*time.Second)
+	// Safety cap on a headless run (a hung browser must not wedge the check). 45s
+	// matches the CLI's default per-check budget and leaves headroom for a cold
+	// Chrome start under load / the race detector on CI, where 30s could flake.
+	ctx, cancelT := context.WithTimeout(ctx, 45*time.Second)
 	defer cancelT()
 
 	var out string

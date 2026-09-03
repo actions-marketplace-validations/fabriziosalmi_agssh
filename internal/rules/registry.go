@@ -2,7 +2,8 @@ package rules
 
 import "github.com/fabriziosalmi/agssh/internal/manifest"
 
-// All returns every rule in AGSSH-STD-001 v1.0.0 with its metadata and checker.
+// All returns every rule in AGSSH-STD-001 (version: StandardVersion) with its
+// metadata and checker.
 // Rules with Plane==PlaneEngine carry a nil Check and are evaluated by the
 // engine itself (waiver governance, signing, hermetic-build hints).
 func All() []Rule {
@@ -13,7 +14,7 @@ func All() []Rule {
 		{"AG-NET-02", "Override library default CDN loaders", "AG-NET", Must, Critical, B, PlaneStatic, always, chkNoCDNLoaders},
 		{"AG-NET-03", "Same-origin workers; constrain worker-src", "AG-NET", Must, High, S, PlaneStatic, always, chkWorkerSrc},
 		{"AG-NET-04", "Constrain connect-src", "AG-NET", Must, Critical, B, PlaneStatic, always, chkConnectSrc},
-		{"AG-NET-05", "Prove offline operation", "AG-NET", Must, High, S, PlaneDynamic, always, chkOfflineProof},
+		{"AG-NET-05", "No third-party egress during load", "AG-NET", Must, High, S, PlaneDynamic, always, chkOfflineProof},
 		{"AG-NET-06", "No third-party connection priming", "AG-NET", Must, Medium, S, PlaneStatic, always, chkNoPriming},
 		{"AG-NET-07", "Service Worker hygiene", "AG-NET", Must, High, S, PlaneDynamic, ifServiceWorker, chkServiceWorker},
 		{"AG-NET-08", "Violation/error reporting stays same-origin", "AG-NET", Must, Medium, S, PlaneStatic, always, chkReportSameOrigin},
@@ -57,12 +58,12 @@ func All() []Rule {
 		{"AG-CI-01", "Pin Actions to a 40-char SHA", "AG-CI", Must, High, S, PlaneCI, always, chkPinnedActions},
 		{"AG-CI-02", "Least-privilege workflow tokens", "AG-CI", Must, High, S, PlaneCI, always, chkLeastPriv},
 		{"AG-CI-03", "No untrusted code in privileged context", "AG-CI", Must, Critical, S, PlaneCI, always, chkNoUntrustedPriv},
-		{"AG-CI-04", "Secrets are not exposed to forks", "AG-CI", Must, High, S, PlaneCI, always, todo("audit pull_request workflows for secret exposure")},
+		{"AG-CI-04", "Secrets are not exposed to forks", "AG-CI", Must, High, S, PlaneCI, always, chkNoSecretExposure},
 		{"AG-CI-05", "Protected branch + required checks", "AG-CI", Should, Medium, S, PlaneCI, always, chkBranchProtection},
 		{"AG-CI-06", "Automated contributors under the same gate", "AG-CI", Should, Medium, G, PlaneCI, always, todo("verify bot PRs run the required check")},
 
 		// ---- §8 AG-PRV — Privacy & Data Minimization ----
-		{"AG-PRV-01", "Zero telemetry by default", "AG-PRV", Must, Critical, B, PlaneStatic, atLevels(manifest.L0, manifest.L1), chkZeroTelemetry},
+		{"AG-PRV-01", "Zero telemetry by default", "AG-PRV", Must, Critical, B, PlaneStatic, always, chkZeroTelemetry},
 		{"AG-PRV-02", "No pre-consent egress", "AG-PRV", Must, Critical, B, PlaneDynamic, always, chkPreConsentEgress},
 		{"AG-PRV-03", "Self-host fonts", "AG-PRV", Must, High, B, PlaneStatic, always, chkSelfHostFonts},
 		{"AG-PRV-04", "Minimize client storage", "AG-PRV", Must, Medium, S, PlaneDynamic, always, chkClientStorage},
@@ -83,4 +84,33 @@ func All() []Rule {
 		{"AG-GOV-06", "Active egress canary", "AG-GOV", Must, High, S, PlaneDynamic, always, chkEgressCanary},
 		{"AG-GOV-07", "Build environment is ephemeral and hermetic", "AG-GOV", Must, High, G, PlaneEngine, always, nil},
 	}
+}
+
+// ruleLevels declares which LEVELS a rule is in scope for, kept SEPARATE from a
+// rule's surface applicability (Applies). A rule absent from the map is in scope
+// at every level. Level-scope is distinct from surface-scope because the engine
+// treats them differently: a rule out of scope for the SURFACE is excluded
+// outright, whereas a rule out of scope only for the LEVEL is still evaluated and
+// kept as earned credit if the surface passes it — so exceeding a stricter level's
+// demand never lowers the score (see engine scoring; dogfooding finding RUN-06).
+var ruleLevels = map[string][]manifest.Level{
+	// AG-PRV-01 (zero telemetry) is required at the air-gapped levels; L2 (marketing)
+	// tolerates telemetry, so at L2 a surface that still has zero telemetry earns the
+	// point, and one that does not is excused rather than penalised.
+	"AG-PRV-01": {manifest.L0, manifest.L1},
+}
+
+// LevelInScope reports whether rule id is required at level l. A rule with no
+// declared level-scope is in scope at every level.
+func LevelInScope(id string, l manifest.Level) bool {
+	levels, ok := ruleLevels[id]
+	if !ok {
+		return true
+	}
+	for _, x := range levels {
+		if x == l {
+			return true
+		}
+	}
+	return false
 }

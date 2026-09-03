@@ -11,11 +11,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/miekg/dns"
 )
+
+// ansiCSIRe matches ANSI CSI escape sequences (colour codes, cursor moves) that
+// scanners emit on a TTY; they are noise, not evidence.
+var ansiCSIRe = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
 
 // effectiveResolver resolves the DNS server to query: the explicit override
 // (manifest dns.resolver / -resolver), else the host's own configured resolver
@@ -54,7 +59,11 @@ func dnsQuery(resolver, zone string, qtype uint16, wantDO bool) (*dns.Msg, error
 	return resp, err
 }
 
-// AG-DNS-01: a CAA policy exists on the zone.
+// AG-DNS-01: a CAA policy RESTRICTS certificate issuance on the zone. It is not
+// enough that some CAA record exists — a zone that publishes only iodef (a
+// contact address) or another non-issuance tag pins issuance to no one. The MUST
+// (title: "CAA pins certificate issuance") requires at least one issue/issuewild
+// property. `issue ";"` counts: it forbids all issuance, a valid restriction.
 func chkCAA(_ context.Context, c *CheckCtx) Outcome {
 	if c.Zone == "" {
 		return inconclusive("no dns.zone declared in manifest")
@@ -67,16 +76,27 @@ func chkCAA(_ context.Context, c *CheckCtx) Outcome {
 	if err != nil {
 		return inconclusive("CAA query failed: " + err.Error())
 	}
-	var issuers []string
+	var records []string
+	restricts := false
 	for _, rr := range resp.Answer {
 		if caa, ok := rr.(*dns.CAA); ok {
-			issuers = append(issuers, caa.Tag+":"+caa.Value)
+			records = append(records, caa.Tag+":"+caa.Value)
+			switch strings.ToLower(caa.Tag) { // CAA tags are case-insensitive
+			case "issue", "issuewild":
+				restricts = true
+			}
 		}
 	}
-	if len(issuers) == 0 {
-		return bad("no CAA records", "a CAA policy restricting issuance")
+	if !restricts {
+		observed := "no issue/issuewild CAA property"
+		if len(records) > 0 {
+			observed += " (present: " + strings.Join(records, " ") + ")"
+		} else {
+			observed = "no CAA records"
+		}
+		return bad(observed, "a CAA policy restricting issuance (issue/issuewild)")
 	}
-	return okay("CAA present: "+strings.Join(issuers, " "), "")
+	return okay("CAA restricts issuance: "+strings.Join(records, " "), "")
 }
 
 // AG-DNS-02: the zone is DNSSEC-signed (AD bit from a validating resolver, or
@@ -364,19 +384,60 @@ func chkPinnedDeps(_ context.Context, c *CheckCtx) Outcome {
 
 // AG-SUP-04: no secrets in the shipped artifact (gitleaks over dist).
 func chkNoSecrets(ctx context.Context, c *CheckCtx) Outcome {
+	dir := c.DistDir
+	if !dirExists(dir) {
+		dir = c.RepoDir
+	}
+	if !dirExists(dir) {
+		// No artifact/repo to inspect (e.g. a URL-only scan): we cannot prove the
+		// shipped output is secret-free, so fail-closed to INCONCLUSIVE — never
+		// scan the process's working directory by accident.
+		return inconclusive("no dist/repo directory to scan for secrets")
+	}
+	if !hasScannableFiles(dir) {
+		// The directory exists but holds no shipped artifacts (empty, or only
+		// config/VCS metadata). An empty scan is not evidence of "no secrets" — it
+		// is evidence that nothing was examined. N/A, not a vacuous PASS.
+		return naReason("no shipped artifacts to scan for secrets (empty or config-only directory)")
+	}
 	if c.Tools.Gitleaks == "" {
 		return inconclusive("gitleaks not found on PATH")
 	}
-	dir := c.DistDir
-	if _, err := os.Stat(dir); err != nil {
-		dir = c.RepoDir
+	// gitleaks exits 1 for BOTH "leaks found" and some fatal scan errors (an
+	// unreadable file, a malformed .gitleaks.toml), so the exit code alone cannot
+	// tell a real finding from a broken run. Take the verdict from the JSON report
+	// instead: findings present -> FAIL; an empty report (or a clean exit with no
+	// report) -> PASS; no parseable report on a non-zero exit -> INCONCLUSIVE. A
+	// tool that could not run must never manufacture a secret.
+	report, err := os.CreateTemp("", "agssh-gitleaks-*.json")
+	if err != nil {
+		return inconclusive("cannot create gitleaks report file: " + err.Error())
 	}
-	cmd := exec.CommandContext(ctx, c.Tools.Gitleaks, "detect", "--no-banner", "--no-git", "--source", dir)
-	out, err := cmd.CombinedOutput()
-	if err == nil {
+	reportPath := report.Name()
+	report.Close()
+	defer os.Remove(reportPath)
+
+	cmd := exec.CommandContext(ctx, c.Tools.Gitleaks, "detect", "--no-banner", "--no-git",
+		"--source", dir, "--report-format", "json", "--report-path", reportPath)
+	out, runErr := cmd.CombinedOutput()
+
+	data, _ := os.ReadFile(reportPath)
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 {
+		var findings []json.RawMessage
+		if json.Unmarshal(trimmed, &findings) != nil {
+			return inconclusive("gitleaks report not parseable: " + toolDiag(out))
+		}
+		if len(findings) > 0 {
+			return bad(fmt.Sprintf("gitleaks flagged %d secret(s)", len(findings)), "no secrets in shipped output")
+		}
 		return okay("gitleaks: no secrets", "")
 	}
-	return bad("gitleaks flagged secrets: "+lastLine(out), "no secrets in shipped output")
+	// No report written. A clean exit means nothing to report; a non-zero exit
+	// means the scan itself failed.
+	if runErr == nil {
+		return okay("gitleaks: no secrets", "")
+	}
+	return inconclusive("gitleaks did not complete: " + toolDiag(out))
 }
 
 // AG-SUP-05: no source maps in the shipped artifact.
@@ -384,6 +445,9 @@ func chkNoSourceMaps(_ context.Context, c *CheckCtx) Outcome {
 	dir := c.DistDir
 	if _, err := os.Stat(dir); err != nil {
 		return inconclusive("dist dir not found: " + dir)
+	}
+	if !hasScannableFiles(dir) {
+		return naReason("no shipped artifacts to scan for source maps (empty or config-only directory)")
 	}
 	var found []string
 	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
@@ -398,7 +462,7 @@ func chkNoSourceMaps(_ context.Context, c *CheckCtx) Outcome {
 	if len(found) > 0 {
 		return bad("source maps shipped: "+strings.Join(found, ", "), "no .map files in production output")
 	}
-	return okay("no source maps in dist", "")
+	return okay("no .map files in dist", "")
 }
 
 // AG-SUP-06: no known-vulnerable dependencies (osv-scanner). The exit code is
@@ -406,6 +470,16 @@ func chkNoSourceMaps(_ context.Context, c *CheckCtx) Outcome {
 // lockfiles), so we parse the JSON: a scan error -> INCONCLUSIVE (honest,
 // fail-closed), real advisories -> FAIL, clean -> PASS.
 func chkNoKnownVulns(ctx context.Context, c *CheckCtx) Outcome {
+	if !dirExists(c.RepoDir) {
+		// No repository to scan (e.g. a URL-only scan). Refuse to let osv-scanner
+		// fall back to the process working directory ("" scans '.').
+		return inconclusive("no repository directory to scan for known vulnerabilities")
+	}
+	if !hasScannableFiles(c.RepoDir) {
+		// Directory present but no shipped artifacts — inapplicable, not a clean
+		// bill of health. Coherent with AG-SUP-04 on the same input (RUN-04).
+		return naReason("no shipped artifacts to scan for known vulnerabilities (empty or config-only directory)")
+	}
 	if c.Tools.OSVScanner == "" {
 		return inconclusive("osv-scanner not found on PATH")
 	}
@@ -415,7 +489,7 @@ func chkNoKnownVulns(ctx context.Context, c *CheckCtx) Outcome {
 	_ = cmd.Run() // verdict comes from the JSON, not the exit code
 	n, ids, ok := parseOSVResults(stdout.Bytes())
 	if !ok {
-		return inconclusive("osv-scanner produced no parseable JSON (scan error?): " + lastLine(stderr.Bytes()))
+		return inconclusive("osv-scanner produced no parseable JSON (scan error?): " + toolDiag(stderr.Bytes()))
 	}
 	if n == 0 {
 		return okay("osv-scanner: no known vulnerabilities", "")
@@ -475,7 +549,18 @@ func parseOSVResults(jsonOut []byte) (count int, ids []string, ok bool) {
 // AG-SUP-07: an SBOM is produced and retained.
 func chkSBOM(_ context.Context, c *CheckCtx) Outcome {
 	patterns := []string{"*.spdx.json", "*.cdx.json", "sbom.json", "bom.json", "*.sbom"}
+	roots := make([]string, 0, 2)
 	for _, root := range []string{c.DistDir, c.RepoDir} {
+		if dirExists(root) {
+			roots = append(roots, root)
+		}
+	}
+	if len(roots) == 0 {
+		// No dist/repo to inspect (e.g. a URL-only scan) — we cannot prove an SBOM
+		// exists or is absent, so fail-closed to INCONCLUSIVE rather than FAIL.
+		return inconclusive("no dist/repo directory to scan for an SBOM")
+	}
+	for _, root := range roots {
 		for _, pat := range patterns {
 			matches, _ := filepath.Glob(filepath.Join(root, pat))
 			if len(matches) > 0 {
@@ -486,14 +571,81 @@ func chkSBOM(_ context.Context, c *CheckCtx) Outcome {
 	return bad("no SBOM artifact found", "an SPDX/CycloneDX SBOM retained with the build")
 }
 
-func lastLine(b []byte) string {
+// dirExists reports whether p names an existing directory. An empty path is
+// never a directory — guarding on it keeps filepath.Join(p, name) from
+// collapsing to a working-directory-relative read.
+func dirExists(p string) bool {
+	if strings.TrimSpace(p) == "" {
+		return false
+	}
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+// hasScannableFiles reports whether dir holds at least one regular file that
+// counts as shipped output: a non-hidden file outside a dot-directory. Config
+// and VCS metadata (.airgap.yml, .gitleaks.toml, .git/, .github/) are not shipped
+// artifacts, so a directory holding only those has nothing for the supply-plane
+// scanners to judge — scanning it and reporting "clean" would be a vacuous PASS.
+// The supply family treats such a directory as N/A rather than PASS.
+func hasScannableFiles(dir string) bool {
+	found := false
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != dir && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir // .git, .github, …
+			}
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") {
+			return nil // hidden file (.airgap.yml, .gitleaks.toml) — not shipped output
+		}
+		found = true
+		return filepath.SkipAll // one is enough
+	})
+	return found
+}
+
+// toolDiag turns a scanner's raw output into ONE sanitized diagnostic line that
+// is safe to embed as rule evidence. A scanner that fails to run tends to print
+// its own usage/`--help` chatter (which is UX about the tool, not evidence about
+// the surface) plus banners and control characters; surfacing that verbatim made
+// an INCONCLUSIVE read like the surface itself said "see --help". toolDiag scans
+// bottom-up for the last line that carries an actual diagnostic, strips the
+// usage tail and control characters, and caps the length.
+func toolDiag(b []byte) string {
 	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
-	if len(lines) == 0 {
-		return ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		if s := sanitizeDiagLine(lines[i]); s != "" {
+			return s
+		}
 	}
-	s := lines[len(lines)-1]
-	if len(s) > 200 {
-		s = s[:200]
+	return "(no diagnostic output)"
+}
+
+// sanitizeDiagLine returns the evidence-bearing part of one output line, or ""
+// if the line is a blank / a pure "run … --help for usage" pointer.
+func sanitizeDiagLine(line string) string {
+	line = ansiCSIRe.ReplaceAllString(line, "")
+	if i := strings.Index(strings.ToLower(line), "--help"); i >= 0 {
+		line = line[:i] // drop the "--help for usage" tail: UX, not evidence
 	}
-	return s
+	line = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, line)
+	line = strings.TrimRight(strings.Join(strings.Fields(line), " "), " ,;.-")
+	low := strings.ToLower(line)
+	if line == "" || low == "usage" || strings.HasPrefix(low, "run ") || strings.HasPrefix(low, "see ") {
+		return "" // carries no evidence once the usage pointer is removed
+	}
+	if len(line) > 160 {
+		line = line[:160] + "…"
+	}
+	return line
 }

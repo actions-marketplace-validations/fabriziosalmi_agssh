@@ -2,8 +2,11 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,14 +22,68 @@ func TestFetchDocsMultiPath(t *testing.T) {
 	defer srv.Close()
 	client := httpx.New(3 * time.Second)
 
-	docs := fetchDocs(client, srv.URL, []string{"/extra", "/extra"}, 3*time.Second)
+	docs, rootErr := fetchDocs(client, srv.URL, []string{"/extra", "/extra"}, 3*time.Second)
 	if len(docs) != 2 { // root + /extra (deduped)
 		t.Fatalf("got %d docs, want 2 (root + one deduped path)", len(docs))
 	}
-	// An unreachable extra path is dropped; the root still comes back.
-	docs = fetchDocs(client, srv.URL, []string{"http://127.0.0.1:1/down"}, 1*time.Second)
-	if len(docs) != 1 {
-		t.Fatalf("got %d docs, want 1 (unreachable path dropped)", len(docs))
+	if rootErr != nil {
+		t.Fatalf("reachable root must have no error, got %v", rootErr)
+	}
+	// An unreachable extra path is dropped; the root still comes back with no error.
+	docs, rootErr = fetchDocs(client, srv.URL, []string{"http://127.0.0.1:1/down"}, 1*time.Second)
+	if len(docs) != 1 || rootErr != nil {
+		t.Fatalf("got %d docs (err %v), want 1 with no root error (unreachable path dropped)", len(docs), rootErr)
+	}
+	// An unreachable ROOT yields zero docs and a non-nil transport error.
+	docs, rootErr = fetchDocs(client, "http://127.0.0.1:1/", nil, 1*time.Second)
+	if len(docs) != 0 || rootErr == nil {
+		t.Fatalf("unreachable root: got %d docs err=%v, want 0 docs and a non-nil error", len(docs), rootErr)
+	}
+}
+
+// TestEvaluateUnscannableSurface pins the reachability gate: when the surface
+// root cannot be fetched, Evaluate returns a distinct UNSCANNABLE record with no
+// verdict, score, fix queue, or results — the runner never observed the surface,
+// so it makes no claim about it.
+func TestEvaluateUnscannableSurface(t *testing.T) {
+	surf := manifest.Surface{URL: "http://127.0.0.1:1/", Kind: "site", Stateless: true}
+	cfg := &manifest.Config{TargetProfile: "Bronze", Level: "L0", Surfaces: []manifest.Surface{surf}}
+	rec := Evaluate(cfg, surf, Options{
+		HTTP: httpx.New(500 * time.Millisecond), Now: time.Now(), PerCheck: 500 * time.Millisecond,
+	})
+	if !rec.Unscannable {
+		t.Fatalf("an unreachable root must be UNSCANNABLE; got conformant=%v results=%d", rec.Conformant, len(rec.Results))
+	}
+	if rec.Conformant {
+		t.Error("an unscannable surface must never be conformant")
+	}
+	if rec.Score.Possible != 0 || len(rec.FixQueue) != 0 || len(rec.Results) != 0 {
+		t.Errorf("unscannable must emit no score/fixqueue/results; got score=%+v fixq=%d results=%d",
+			rec.Score, len(rec.FixQueue), len(rec.Results))
+	}
+	if rec.Unreachable == "" {
+		t.Error("unscannable must carry a human transport reason")
+	}
+}
+
+// TestUnreachableReasonClassifies pins the human wording per failure mode.
+func TestUnreachableReasonClassifies(t *testing.T) {
+	cases := []struct {
+		name  string
+		cause error
+		want  string // substring
+	}{
+		{"nxdomain", &net.DNSError{Err: "no such host", Name: "nope.invalid", IsNotFound: true}, "does not resolve"},
+		{"refused", errors.New("dial tcp 127.0.0.1:1: connect: connection refused"), "refused"},
+		{"timeout", context.DeadlineExceeded, "did not respond"},
+		{"tls", errors.New("x509: certificate signed by unknown authority"), "TLS handshake"},
+		{"nil", nil, "per-check timeout"},
+	}
+	for _, c := range cases {
+		got := unreachableReason("https://host.example/", c.cause)
+		if !strings.Contains(got, c.want) {
+			t.Errorf("%s: reason %q must contain %q", c.name, got, c.want)
+		}
 	}
 }
 
@@ -73,6 +130,30 @@ func res(ob rules.Obligation, sev rules.Severity, st rules.Status, waived bool) 
 // passes the gate iff it is not (Failing AND not waived). Failing == Fail or
 // Inconclusive. This is the core promise — nothing is green unless proven — as a
 // closed-form truth table, so there is no doubt about the verdict logic.
+func TestEnforceCIRulesGate(t *testing.T) {
+	surf := manifest.Surface{URL: "https://example.test/", Kind: "site", Stateless: true}
+	hasCI := func(enforce bool) bool {
+		cfg := &manifest.Config{
+			TargetProfile: "Silver", Level: "L2",
+			Surfaces: []manifest.Surface{surf},
+			Pipeline: manifest.Pipeline{EnforceCIRules: enforce},
+		}
+		rec := Evaluate(cfg, surf, Options{Now: time.Now(), PerCheck: time.Second})
+		for _, r := range rec.Results {
+			if r.Family == "AG-CI" {
+				return true
+			}
+		}
+		return false
+	}
+	if hasCI(false) {
+		t.Errorf("enforce_ci_rules=false must exclude the AG-CI family")
+	}
+	if !hasCI(true) {
+		t.Errorf("enforce_ci_rules=true must evaluate the AG-CI family")
+	}
+}
+
 func TestGateTruthTable(t *testing.T) {
 	statuses := []rules.Status{rules.Pass, rules.Fail, rules.Inconclusive, rules.NotApplicable}
 	for _, st := range statuses {
@@ -147,6 +228,49 @@ func TestScore(t *testing.T) {
 	}
 	if s.Pct < 71.4 || s.Pct > 71.5 {
 		t.Errorf("pct = %.2f, want ~71.43", s.Pct)
+	}
+	if s.Scored != 3 { // 3 non-N/A rules in the denominator (the N/A is excluded)
+		t.Errorf("scored = %d, want 3 (N/A excluded from the level-relative scope)", s.Scored)
+	}
+}
+
+// TestBuildEnvironmentDegraded pins RUN-07: a missing tool that silently disabled
+// a plane (Chrome → dynamic) surfaces as degraded=true with the tool named, so a
+// consumer summarising by status can still tell a partial scan from a complete
+// one. A missing tool that no in-scope rule needed does not degrade.
+func TestBuildEnvironmentDegraded(t *testing.T) {
+	dynInc := rules.Stamp(
+		rules.Rule{ID: "AG-PRV-02", Plane: rules.PlaneDynamic, Severity: rules.Critical, Obligation: rules.Must, Profile: manifest.Bronze},
+		rules.IncOutcome("headless load failed"),
+	)
+	staticPass := rules.Stamp(
+		rules.Rule{ID: "AG-CSP-01", Plane: rules.PlaneStatic, Severity: rules.High, Profile: manifest.Bronze},
+		rules.PassOutcome("ok", ""),
+	)
+	has := func(ss []string, w string) bool {
+		for _, s := range ss {
+			if s == w {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Chrome absent + a dynamic rule INCONCLUSIVE -> degraded, chrome named.
+	env := buildEnvironment(rules.Toolbox{}, []rules.Result{dynInc, staticPass})
+	if !env.Degraded || !has(env.MissingTools, "chrome") {
+		t.Fatalf("chrome absent + dynamic INCONCLUSIVE must be degraded; got %+v", env)
+	}
+	if env.Tools["chrome"] {
+		t.Error("tools[chrome] must be false when Chrome is not resolved")
+	}
+	// Chrome present -> not degraded, even with a dynamic INCONCLUSIVE from another cause.
+	if env2 := buildEnvironment(rules.Toolbox{Chrome: "/usr/bin/chrome"}, []rules.Result{dynInc, staticPass}); env2.Degraded {
+		t.Errorf("Chrome present must not be degraded; got %+v", env2)
+	}
+	// A missing tool no in-scope rule needed -> not degraded.
+	if env3 := buildEnvironment(rules.Toolbox{Chrome: "/usr/bin/chrome"}, []rules.Result{staticPass}); env3.Degraded {
+		t.Errorf("a missing tool no rule needed must not degrade; got %+v", env3)
 	}
 }
 
@@ -300,4 +424,59 @@ func twoShoulds(t *testing.T, idx map[string]rules.Rule) (string, string) {
 	}
 	t.Fatal("need two SHOULD rules visible at Silver")
 	return "", ""
+}
+
+// TestLevelScopedBonusCredit pins RUN-06's monotonic-scoring model: AG-PRV-01 is
+// level-scoped to L0/L1. A surface that PASSES it still earns the credit at L2
+// (out of scope → bonus), while a surface that FAILS it is excused at L2 (dropped,
+// not penalized). So relaxing the level can only add passing rules, never remove
+// them — the score is monotonic across levels.
+func TestLevelScopedBonusCredit(t *testing.T) {
+	clean := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<!doctype html><html><head><title>t</title></head><body>hi</body></html>`))
+	}))
+	defer clean.Close()
+	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<!doctype html><html><head><script src="https://plausible.io/js/script.js"></script></head><body>hi</body></html>`))
+	}))
+	defer tracker.Close()
+
+	prv01 := func(url, level string) (present bool, status string) {
+		surf := manifest.Surface{URL: url, Kind: "site", Stateless: true}
+		cfg := &manifest.Config{TargetProfile: "Bronze", Level: level, Surfaces: []manifest.Surface{surf}}
+		rec := Evaluate(cfg, surf, Options{HTTP: httpx.New(3 * time.Second), Now: time.Now(), PerCheck: 3 * time.Second})
+		for _, res := range rec.Results {
+			if res.RuleID == "AG-PRV-01" {
+				return true, res.Status
+			}
+		}
+		return false, ""
+	}
+
+	// Clean surface: PASS in scope (L0) AND kept as PASS out of scope (L2 bonus).
+	if p, s := prv01(clean.URL, "L0"); !p || s != "PASS" {
+		t.Errorf("clean@L0: AG-PRV-01 present=%v status=%s, want present PASS", p, s)
+	}
+	if p, s := prv01(clean.URL, "L2"); !p || s != "PASS" {
+		t.Errorf("clean@L2: AG-PRV-01 must be kept as a PASS (bonus credit); present=%v status=%s", p, s)
+	}
+	// Tracker surface: FAIL in scope (L0), but EXCUSED (absent) out of scope (L2).
+	if p, s := prv01(tracker.URL, "L0"); !p || s != "FAIL" {
+		t.Errorf("tracker@L0: AG-PRV-01 present=%v status=%s, want present FAIL", p, s)
+	}
+	if p, _ := prv01(tracker.URL, "L2"); p {
+		t.Errorf("tracker@L2: a failing out-of-level rule must be excused (dropped), not penalized")
+	}
+}
+
+func TestLevelInScope(t *testing.T) {
+	if !rules.LevelInScope("AG-PRV-01", manifest.L0) || !rules.LevelInScope("AG-PRV-01", manifest.L1) {
+		t.Error("AG-PRV-01 must be in scope at L0 and L1")
+	}
+	if rules.LevelInScope("AG-PRV-01", manifest.L2) {
+		t.Error("AG-PRV-01 must be OUT of scope at L2")
+	}
+	if !rules.LevelInScope("AG-NET-01", manifest.L2) {
+		t.Error("a rule with no declared level-scope must be in scope at every level")
+	}
 }

@@ -5,6 +5,9 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -16,7 +19,9 @@ import (
 	"github.com/fabriziosalmi/agssh/internal/rules"
 )
 
-const docVersion = "v1.0.0"
+// docVersion is generated from CHANGELOG.md by standard/build_pdf.py so the
+// banner and the signed record can never drift from the project version.
+const docVersion = rules.StandardVersion
 
 type Options struct {
 	RepoDir      string
@@ -45,12 +50,24 @@ func Evaluate(cfg *manifest.Config, surface manifest.Surface, opts Options) *rep
 	// the root document by default; for multi-path surfaces they are evaluated
 	// worst-case across every sampled document (a weaker per-path header loses).
 	var docs []*httpx.Doc
+	var rootErr error
 	if opts.HTTP != nil {
-		docs = fetchDocs(opts.HTTP, surface.URL, surface.Paths, opts.PerCheck)
+		docs, rootErr = fetchDocs(opts.HTTP, surface.URL, surface.Paths, opts.PerCheck)
 	}
 	var rootDoc *httpx.Doc
 	if len(docs) > 0 {
 		rootDoc = docs[0]
+	}
+
+	// Reachability gate: a fetch was attempted but the surface root never came
+	// back. The runner observed nothing — emitting a verdict, score, or badge
+	// would be a claim about a surface it never saw. Return a distinct
+	// UNSCANNABLE record (fail-closed, but honestly labelled) instead of scoring
+	// a pile of "surface not fetched" INCONCLUSIVEs as if the surface were merely
+	// weak. Only triggers when HTTP was actually configured (nil HTTP = an
+	// offline/source-only evaluation, e.g. some unit tests, which is legitimate).
+	if opts.HTTP != nil && rootDoc == nil {
+		return unscannableRecord(surface, profile, level, opts.Now, rootErr)
 	}
 
 	resolver := opts.Resolver
@@ -82,6 +99,9 @@ func Evaluate(cfg *manifest.Config, surface manifest.Surface, opts Options) *rep
 		if r.Plane == rules.PlaneEngine {
 			continue // governance rules handled below
 		}
+		if r.Plane == rules.PlaneCI && !cfg.Pipeline.EnforceCIRules {
+			continue // AG-CI family gated off by pipeline.enforce_ci_rules=false
+		}
 		check := r.Check
 		if check == nil {
 			results = append(results, rules.Stamp(r, rules.IncOutcome("no checker bound")))
@@ -95,7 +115,18 @@ func Evaluate(cfg *manifest.Config, surface manifest.Surface, opts Options) *rep
 			out = check(ctx, cctx)
 		}
 		cancel()
-		results = append(results, rules.Stamp(r, out))
+		res := rules.Stamp(r, out)
+		if !rules.LevelInScope(r.ID, level) {
+			// Out of scope at this level: the level does not DEMAND this rule. Keep
+			// it only if the surface passes it anyway — exceeding a stricter rule
+			// than the level requires is earned credit, never a penalty. A non-pass
+			// here is excused (dropped), not counted, so relaxing the level can only
+			// ADD passing rules to the score, never remove them (RUN-06 monotonicity).
+			if res.Raw() != rules.Pass {
+				continue
+			}
+		}
+		results = append(results, res)
 	}
 
 	// 2) Governance (AG-GOV-01..04) + waiver set.
@@ -160,8 +191,108 @@ func Evaluate(cfg *manifest.Config, surface manifest.Surface, opts Options) *rep
 	// 7) Gate (fail-closed) + score + fix queue.
 	rec.Conformant = gate(rec.Results, violations)
 	rec.Score = score(rec.Results, active, byID)
-	rec.FixQueue = report.BuildFixQueue(rec.Results)
+	rec.FixQueue = report.BuildFixQueue(rec.Results)     // FAIL only — actionable
+	rec.Unassessed = report.BuildUnassessed(rec.Results) // INCONCLUSIVE — could not verify
+	rec.Environment = buildEnvironment(tools, rec.Results)
 	return rec
+}
+
+// unscannableRecord is the record for a surface whose root could not be fetched:
+// no results, no score, no fix queue — only the transport cause, in the runner's
+// own words. It is not conformant (nothing was proven) but it is distinct from a
+// non-conformant surface, and the CLI maps it to its own exit code.
+func unscannableRecord(surface manifest.Surface, profile manifest.Profile, level manifest.Level, now time.Time, cause error) *report.Record {
+	return &report.Record{
+		Standard:    "AGSSH-STD-001",
+		Version:     docVersion,
+		Generator:   "agssh-runner " + docVersion,
+		GeneratedAt: now.UTC().Format(time.RFC3339),
+		Surface:     surface.URL,
+		Profile:     profile.String(),
+		Level:       level.String(),
+		Conformant:  false,
+		Unscannable: true,
+		Unreachable: unreachableReason(surface.URL, cause),
+	}
+}
+
+// unreachableReason turns the raw transport error into one human sentence,
+// distinguishing the failure modes an operator acts on differently: a name that
+// does not resolve, a refused connection, a timeout, or a TLS failure.
+func unreachableReason(surfaceURL string, cause error) string {
+	host := surfaceURL
+	if u, err := url.Parse(surfaceURL); err == nil && u.Host != "" {
+		host = u.Host
+	}
+	if cause == nil {
+		return fmt.Sprintf("could not fetch %s within the per-check timeout", host)
+	}
+	var dnsErr *net.DNSError
+	if errors.As(cause, &dnsErr) {
+		if dnsErr.IsNotFound {
+			return fmt.Sprintf("%s does not resolve (no DNS record)", host)
+		}
+		return fmt.Sprintf("DNS lookup for %s failed: %s", host, dnsErr.Err)
+	}
+	msg := cause.Error()
+	switch {
+	case strings.Contains(msg, "connection refused"):
+		return fmt.Sprintf("connection to %s refused (nothing is listening)", host)
+	case errors.Is(cause, context.DeadlineExceeded) || strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded"):
+		return fmt.Sprintf("%s did not respond before the per-check timeout", host)
+	case strings.Contains(msg, "x509") || strings.Contains(msg, "certificate") || strings.Contains(msg, "tls:"):
+		return fmt.Sprintf("TLS handshake with %s failed: %s", host, msg)
+	default:
+		return fmt.Sprintf("could not reach %s: %s", host, msg)
+	}
+}
+
+// buildEnvironment reports which external tools the runner resolved and whether a
+// missing one silently disabled a plane — so a consumer can tell a complete scan
+// from a partial one. A tool is only counted as "degraded" when its plane
+// actually produced an INCONCLUSIVE result attributable to its absence, so an
+// environment missing a tool no in-scope rule needed is not flagged.
+func buildEnvironment(tools rules.Toolbox, results []rules.Result) *report.Environment {
+	present := map[string]bool{
+		"chrome":      tools.Chrome != "",
+		"gitleaks":    tools.Gitleaks != "",
+		"osv-scanner": tools.OSVScanner != "",
+		"cosign":      tools.Cosign != "",
+		"zizmor":      tools.Zizmor != "",
+	}
+	dynamicInc, gitleaksInc, osvInc := false, false, false
+	for _, r := range results {
+		if r.Status != "INCONCLUSIVE" {
+			continue
+		}
+		switch {
+		case r.Plane == "dynamic":
+			dynamicInc = true
+		case strings.Contains(r.Err, "gitleaks not found"):
+			gitleaksInc = true
+		case strings.Contains(r.Err, "osv-scanner not found"):
+			osvInc = true
+		}
+	}
+	var missing, reasons []string
+	if !present["chrome"] && dynamicInc {
+		missing = append(missing, "chrome")
+		reasons = append(reasons, "no headless browser — the dynamic plane did not run (pre-consent egress, offline proof, egress canary); set AGSSH_CHROME to a Chrome/Chromium binary")
+	}
+	if !present["gitleaks"] && gitleaksInc {
+		missing = append(missing, "gitleaks")
+		reasons = append(reasons, "gitleaks absent — the shipped-secrets scan did not run")
+	}
+	if !present["osv-scanner"] && osvInc {
+		missing = append(missing, "osv-scanner")
+		reasons = append(reasons, "osv-scanner absent — the known-vulnerability scan did not run")
+	}
+	return &report.Environment{
+		Degraded:     len(reasons) > 0,
+		Reason:       strings.Join(reasons, "; "),
+		Tools:        present,
+		MissingTools: missing,
+	}
 }
 
 // gate blocks on ANY failing MUST, any unwaived failing SHOULD, or any
@@ -180,11 +311,12 @@ func gate(results []rules.Result, violations []string) bool {
 
 // score is the weighted conformance score; deviation debt is reported beside it.
 func score(results []rules.Result, active map[string]bool, byID map[string]rules.Rule) report.Score {
-	earned, possible := 0, 0
+	earned, possible, scored := 0, 0, 0
 	for _, res := range results {
 		if res.Status == "N/A" {
 			continue
 		}
+		scored++
 		w := res.Sev().Weight()
 		possible += w
 		if res.Status == "PASS" {
@@ -201,13 +333,15 @@ func score(results []rules.Result, active map[string]bool, byID map[string]rules
 	if possible > 0 {
 		pct = 100 * float64(earned) / float64(possible)
 	}
-	return report.Score{Earned: earned, Possible: possible, Pct: pct, DeviationDebt: debt}
+	return report.Score{Earned: earned, Possible: possible, Pct: pct, DeviationDebt: debt, Scored: scored}
 }
 
 // fetchDocs retrieves the surface root plus any extra declared same-origin
-// paths, each with bounded retries. The root is always first; unreachable URLs
-// are dropped (a static check over zero docs stays INCONCLUSIVE via cctx.Doc==nil).
-func fetchDocs(client *httpx.Client, surfaceURL string, paths []string, perCheck time.Duration) []*httpx.Doc {
+// paths, each with bounded retries. The root is always first. Extra paths that
+// fail are dropped; if the ROOT itself cannot be fetched, its transport error is
+// returned so the caller can emit a distinct UNSCANNABLE record rather than
+// silently scoring the surface it never saw.
+func fetchDocs(client *httpx.Client, surfaceURL string, paths []string, perCheck time.Duration) ([]*httpx.Doc, error) {
 	targets := []string{surfaceURL}
 	if base, err := url.Parse(surfaceURL); err == nil {
 		seen := map[string]bool{surfaceURL: true}
@@ -231,12 +365,18 @@ func fetchDocs(client *httpx.Client, surfaceURL string, paths []string, perCheck
 		}
 	}
 	var docs []*httpx.Doc
-	for _, t := range targets {
-		if d := fetchWithRetry(client, t, perCheck, 3); d != nil {
+	var rootErr error
+	for i, t := range targets {
+		d, err := fetchWithRetry(client, t, perCheck, 3)
+		if d != nil {
 			docs = append(docs, d)
+			continue
+		}
+		if i == 0 { // the root surface itself could not be fetched
+			rootErr = err
 		}
 	}
-	return docs
+	return docs, rootErr
 }
 
 // sameOrigin reports whether raw has the same scheme+host(+port) as base.
@@ -251,8 +391,9 @@ func sameOrigin(base *url.URL, raw string) bool {
 // fetchWithRetry retries a transient fetch failure so a single network blip
 // doesn't turn the whole gate red — but all attempts share ONE perCheck budget,
 // so a black-holed host can't multiply latency to attempts×perCheck.
-func fetchWithRetry(client *httpx.Client, target string, perCheck time.Duration, attempts int) *httpx.Doc {
+func fetchWithRetry(client *httpx.Client, target string, perCheck time.Duration, attempts int) (*httpx.Doc, error) {
 	deadline := time.Now().Add(perCheck)
+	var lastErr error
 	for i := 0; i < attempts; i++ {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -262,10 +403,14 @@ func fetchWithRetry(client *httpx.Client, target string, perCheck time.Duration,
 		d, err := client.Fetch(ctx, target)
 		cancel()
 		if err == nil {
-			return d
+			return d, nil
 		}
+		lastErr = err
 	}
-	return nil
+	if lastErr == nil { // ran out of budget before the first attempt completed
+		lastErr = context.DeadlineExceeded
+	}
+	return nil, lastErr
 }
 
 // worstAcrossDocs runs a static checker against every sampled document and keeps

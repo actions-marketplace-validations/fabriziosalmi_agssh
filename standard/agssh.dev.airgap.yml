@@ -1,0 +1,80 @@
+# AGSSH-STD-001 conformance manifest for the standard's own site (agssh.dev).
+# The dogfood: the surface that publishes the standard is scanned against it at the
+# highest bar — Gold profile, L0 (strict air-gap), zero waivers. The header/CSP/TLS
+# rules are satisfied by Cloudflare in front of GitHub Pages (see standard/DEPLOY.md);
+# the supply/CI/governance rules are satisfied by the publish-standard.yml pipeline,
+# which also -signs the record (AG-GOV-05) from an ephemeral OIDC runner (AG-GOV-07).
+target_profile: Gold
+level: L0
+
+surfaces:
+  - url: https://agssh.dev/
+    kind: docs
+    generates_files: false      # a docs site, so AG-OUT-02 (deterministic output) is N/A
+    threaded_wasm: false        # no SharedArrayBuffer, so AG-HDR-06 (COOP/COEP) is N/A
+    has_service_worker: false
+    stateless: true             # no cookies / localStorage
+    paths:
+      - /AGSSH-STD-001-v1.6.0.pdf   # sample the PDF too (worst-case static analysis)
+
+backend: github-pages           # informational; the runner observes the live surface
+
+dns:
+  zone: agssh.dev               # CAA (issue/issuewild) + DNSSEC + dangling checks
+
+pipeline:
+  enforce_ci_rules: true        # apply the AG-CI family to this repo's workflows
+
+allow:                          # L0 is strict: everything empty — no third-party anything
+  connect:      []
+  storage:      []
+  embeds:       []
+  subresources: []
+
+waivers:                        # governed SHOULD deviations — the standard eating
+  budget:                       # its own dog food, waiver mechanism included.
+    max_count: 5
+    max_weight: 9               # 4×MEDIUM(2) + 1×LOW(1) = 9
+    max_window_days: 180
+
+# Five SHOULD rules whose verification is process-specific and not auto-checkable
+# from a single scan. Each is waived WITH a real compensating control (reason +
+# evidence), a distinct approver, and a signature — exactly the governance the
+# standard defines (AG-GOV-02/03/04). MUSTs are never here (AG-GOV-01). Re-attest
+# before `expires`; the runner enforces the expiry against its own clock.
+deviations:
+  - rule: AG-CSP-04             # stage report-only before enforcing
+    reason: "The CSP is rolled out Content-Security-Policy-Report-Only first, then enforced (standard/DEPLOY.md §3). The report-only-history precondition is a process step, not observable from one scan."
+    evidence: "standard/DEPLOY.md §3 (report-only rollout)"
+    approver: security@agssh.dev
+    author: fabrizio.salmi@gmail.com
+    expires: "2027-02-01"
+    signature: "attested-by-approver"
+  - rule: AG-HDR-07             # cache discipline for fingerprinted assets
+    reason: "The site ships no content-hashed asset filenames; a single uniform Cache-Control (public, max-age=600, must-revalidate) is applied at the edge, so there is no stale-fingerprint hazard for this rule to guard."
+    evidence: "Cloudflare Cache-Control header; agssh-std.css / badge.svg are unfingerprinted"
+    approver: security@agssh.dev
+    author: fabrizio.salmi@gmail.com
+    expires: "2027-02-01"
+    signature: "attested-by-approver"
+  - rule: AG-SUP-03             # reproducible build; pinned toolchain
+    reason: "The site is generated deterministically (build_pdf.py pins SOURCE_DATE_EPOCH; build_site.py is pure transforms) and the runner toolchain is pinned via go.mod. A two-build digest comparison is not performed in this scan."
+    evidence: "standard/build_pdf.py byte-reproducible render; go.mod pinned toolchain"
+    approver: security@agssh.dev
+    author: fabrizio.salmi@gmail.com
+    expires: "2027-02-01"
+    signature: "attested-by-approver"
+  - rule: AG-SUP-08             # signed releases / build provenance
+    reason: "The published conformance record is cosign-signed at scan time (AG-GOV-05) and the runner's own releases are cosign-signed (release.yml). A cosign verify-blob against a separate SLSA provenance artifact is not auto-run here."
+    evidence: "publish-standard.yml -sign (keyless cosign OIDC); release.yml goreleaser+cosign"
+    approver: security@agssh.dev
+    author: fabrizio.salmi@gmail.com
+    expires: "2027-02-01"
+    signature: "attested-by-approver"
+  - rule: AG-CI-06             # automated contributors under the same gate
+    reason: "Automated contributors (github-actions, Copilot review) run the same required `ci` check as humans, enforced by branch protection. Static analysis cannot confirm bot-PR gating without the protection API."
+    evidence: "branch protection: `ci` required on main; AG-CI-05 covers the protection itself"
+    approver: security@agssh.dev
+    author: fabrizio.salmi@gmail.com
+    expires: "2027-02-01"
+    signature: "attested-by-approver"

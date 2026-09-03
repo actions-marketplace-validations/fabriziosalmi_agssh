@@ -1,7 +1,8 @@
 // Command agssh is the AGSSH-STD-001 conformance runner. It evaluates each
 // declared surface against its target profile by observing the LIVE deployment,
 // applies governed waivers, and emits a signed conformance record. Exit codes:
-// 0 = conformant, 1 = non-conformant, 2 = usage/internal error.
+// 0 = conformant, 1 = non-conformant, 2 = usage/internal error, 3 = a surface
+// was unscannable (its live deployment could not be fetched).
 package main
 
 import (
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fabriziosalmi/agssh/internal/badge"
 	"github.com/fabriziosalmi/agssh/internal/engine"
 	"github.com/fabriziosalmi/agssh/internal/httpx"
 	"github.com/fabriziosalmi/agssh/internal/manifest"
@@ -41,6 +43,7 @@ func main() {
 	approversPath := flag.String("approvers", "", "file with one approved waiver-approver per line")
 	timeout := flag.Duration("timeout", 45*time.Second, "per-check timeout")
 	resolver := flag.String("resolver", "", "DNS resolver host[:port] for CAA/DNSSEC/dangling (default: host resolv.conf)")
+	badgePath := flag.String("badge", "", "write a self-hosted SVG conformance badge to this path")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -90,13 +93,33 @@ func main() {
 	}
 
 	allConformant := true
+	anyUnscannable := false
 	var records []*report.Record
 	for _, s := range cfg.Surfaces {
 		rec := engine.Evaluate(cfg, s, opts)
 		rec.Render(os.Stdout)
 		records = append(records, rec)
+		if rec.Unscannable {
+			anyUnscannable = true
+		}
 		if !rec.Conformant {
 			allConformant = false
+		}
+	}
+
+	// A self-hosted SVG conformance badge for the whole config: the earned metal
+	// tier when every surface is conformant (mirrors the gate), otherwise the grey
+	// target tier plus the score. Egress-free, so a project can serve it from its
+	// own origin without breaking its own AG-NET-02.
+	if *badgePath != "" {
+		if anyUnscannable {
+			// No verdict was reached for at least one surface, so there is nothing
+			// to certify. Emitting a badge here would misrepresent an unseen surface.
+			fmt.Fprintf(os.Stderr, "badge skipped: a surface was unscannable (no verdict to certify)\n")
+		} else if e := os.WriteFile(*badgePath, badge.RenderAggregate(records), 0o644); e != nil {
+			fail(e)
+		} else {
+			fmt.Fprintf(os.Stderr, "badge written: %s\n", filepath.Clean(*badgePath))
 		}
 	}
 
@@ -119,6 +142,11 @@ func main() {
 	}
 	emitGitHubOutputs(allConformant, reportPath)
 
+	// Exit-3 (unscannable) takes precedence over exit-1 (non-conformant): the two
+	// are different failures — "I could not look" vs "I looked and it fell short".
+	if anyUnscannable {
+		os.Exit(3)
+	}
 	if !allConformant {
 		os.Exit(1)
 	}
