@@ -29,7 +29,7 @@ level: L0
 surfaces: [{url: "https://your-surface.example/", kind: site, stateless: true}]')
 ```
 
-You get a verdict, then a severity-ranked queue of what to fix — and, kept separate,
+You get a verdict, then a severity-ranked queue of what to fix and, kept separate,
 what could not be checked (fail-closed, never a silent pass):
 
 ```text
