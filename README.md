@@ -2,7 +2,7 @@
 
 **Prove your static site makes zero unexpected network calls deterministically, on every push.**
 
-A *surface* — a client-side tool, a docs site, a marketing page should talk only
+A *surface*, a client-side tool, a docs site, a marketing page should talk only
 to its own origin. But nothing stops a CDN font, a stray analytics beacon, or a
 wide-open CSP from quietly turning the browser into a data-exfiltration path.
 **AGSSH-STD-001** (the Air-Gapped Static Surface Hardening standard) pins that
