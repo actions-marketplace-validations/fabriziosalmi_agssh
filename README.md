@@ -18,7 +18,7 @@ shipping static or client-side surfaces where privacy and supply-chain integrity
 
 ## Quick start
 
-Point it at a live URL and read the verdict — no config file to write, no build
+Point it at a live URL and read the verdict; no config file to write, no build
 step, just pass the target inline (needs a Go toolchain; for a no-Go path use the
 Action or the `ghcr.io/fabriziosalmi/agssh` image):
 
