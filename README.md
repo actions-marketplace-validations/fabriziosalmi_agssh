@@ -1,13 +1,13 @@
 # Air-Gapped Static Surface Hardening (agssh)
 
-**Prove your static site makes zero unexpected network calls — deterministically, on every push.**
+**Prove your static site makes zero unexpected network calls deterministically, on every push.**
 
-A *surface* — a client-side tool, a docs site, a marketing page — should talk only
+A *surface* — a client-side tool, a docs site, a marketing page should talk only
 to its own origin. But nothing stops a CDN font, a stray analytics beacon, or a
 wide-open CSP from quietly turning the browser into a data-exfiltration path.
 **AGSSH-STD-001** (the Air-Gapped Static Surface Hardening standard) pins that
 property down, and **`agssh`** is the deterministic, fail-closed runner that
-enforces it — against the *live* deployment, not a promise. Built for teams
+enforces it against the *live* deployment, not a promise. Built for teams
 shipping static or client-side surfaces where privacy and supply-chain integrity
 *are* the product.
 
