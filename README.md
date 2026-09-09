@@ -1,4 +1,4 @@
-# agssh — Air-Gapped Static Surface Hardening
+# Air-Gapped Static Surface Hardening (agssh)
 
 **Prove your static site makes zero unexpected network calls — deterministically, on every push.**
 
