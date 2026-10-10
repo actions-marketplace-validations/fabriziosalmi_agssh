@@ -106,7 +106,9 @@ func hostSuffixIn(host string, list []string) (string, bool) {
 	return "", false
 }
 
-// AG-NET-05: observed network shows no third-party response origins.
+// AG-NET-05: observed network shows no third-party response origins. Hosts the
+// manifest explicitly declares (egressAllowed) are not reported, with the same
+// level gating and exact-host semantics as AG-NET-02/-04.
 func chkOfflineProof(ctx context.Context, c *CheckCtx) Outcome {
 	if c.Tools.Chrome == "" {
 		return inconclusive("no Chrome/Chromium found for headless verification")
@@ -115,14 +117,38 @@ func chkOfflineProof(ctx context.Context, c *CheckCtx) Outcome {
 	if err != nil {
 		return inconclusive("headless load failed: " + err.Error())
 	}
-	return offlineProofVerdict(hostOnly(c.Surface.URL), obs.respondedHosts())
+	return offlineProofVerdict(hostOnly(c.Surface.URL), obs.respondedHosts(), egressAllowed(c))
 }
 
-// offlineProofVerdict fails if any responded host is third-party.
-func offlineProofVerdict(self string, responded []string) Outcome {
+// egressAllowed returns the hosts the manifest declares as legitimate egress:
+// allow.connect and allow.subresources from L1 (scoped egress), allow.embeds from
+// L2 (marketing). Entries may be origins or bare hosts; L0 (strict air-gap)
+// allows nothing. Matching stays exact-host: a sibling subdomain of the surface is
+// NOT implicitly first-party (consistent with AG-NET-02) and must be declared.
+func egressAllowed(c *CheckCtx) []string {
+	var raw []string
+	if c.Level >= 1 {
+		raw = append(raw, c.Allow.Connect...)
+		raw = append(raw, c.Allow.Subresources...)
+	}
+	if c.Level >= 2 {
+		raw = append(raw, c.Allow.Embeds...)
+	}
+	hosts := make([]string, 0, len(raw))
+	for _, e := range raw {
+		if h := hostOnly(e); h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
+}
+
+// offlineProofVerdict fails if any responded host is third-party and not declared
+// in allow (exact host match).
+func offlineProofVerdict(self string, responded, allow []string) Outcome {
 	var third []string
 	for _, h := range responded {
-		if h == "" || h == self {
+		if h == "" || h == self || hostAllowed(h, allow) {
 			continue
 		}
 		third = append(third, h)
