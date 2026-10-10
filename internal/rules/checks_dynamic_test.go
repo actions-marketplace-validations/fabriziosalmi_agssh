@@ -11,11 +11,39 @@ import (
 )
 
 func TestOfflineProofVerdict(t *testing.T) {
-	if offlineProofVerdict("me.test", []string{"me.test", ""}).Status != Pass {
+	if offlineProofVerdict("me.test", []string{"me.test", ""}, nil).Status != Pass {
 		t.Error("only first-party responses: want PASS")
 	}
-	if offlineProofVerdict("me.test", []string{"me.test", "evil.test"}).Status != Fail {
+	if offlineProofVerdict("me.test", []string{"me.test", "evil.test"}, nil).Status != Fail {
 		t.Error("a third-party response: want FAIL")
+	}
+}
+
+// A declared host is exempt, an undeclared one still fails, and a sibling
+// subdomain of the surface is NOT implicitly first-party (issue #69).
+func TestOfflineProofVerdictAllowList(t *testing.T) {
+	resp := []string{"me.test", "api.me.test", "fonts.x.test"}
+	out := offlineProofVerdict("me.test", resp, []string{"api.me.test"})
+	if out.Status != Fail || !strings.Contains(out.Evidence.Observed, "fonts.x.test") || strings.Contains(out.Evidence.Observed, "api.me.test") {
+		t.Errorf("allow api.me.test: want FAIL naming only fonts.x.test, got %v / %q", out.Status, out.Evidence.Observed)
+	}
+	if offlineProofVerdict("me.test", resp, []string{"api.me.test", "fonts.x.test"}).Status != Pass {
+		t.Error("every third-party host declared: want PASS")
+	}
+	if offlineProofVerdict("me.test", []string{"me.test", "api.me.test"}, nil).Status != Fail {
+		t.Error("undeclared sibling subdomain: want FAIL")
+	}
+}
+
+func TestEgressAllowedLevelGating(t *testing.T) {
+	c := &CheckCtx{Allow: manifest.Allow{
+		Connect: []string{"https://api.me.test"}, Subresources: []string{"cdn.me.test"}, Embeds: []string{"https://yt.test/x"},
+	}}
+	for lvl, want := range map[manifest.Level]int{manifest.L0: 0, manifest.L1: 2, manifest.L2: 3} {
+		c.Level = lvl
+		if got := egressAllowed(c); len(got) != want {
+			t.Errorf("level %v: egressAllowed = %v, want %d hosts", lvl, got, want)
+		}
 	}
 }
 

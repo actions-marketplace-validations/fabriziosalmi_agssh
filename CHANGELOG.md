@@ -6,6 +6,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **AG-NET-05 now honours the declared egress allow-list.** Hosts in
+  `allow.connect` and `allow.subresources` (from L1) and `allow.embeds` (from L2) are
+  no longer reported as third-party egress; matching is exact-host, and a sibling
+  subdomain of the surface still has to be declared (consistent with AG-NET-02).
+  L0 still allows nothing. Previously only the exact surface host was exempt, so a
+  surface could not make the rule pass by declaring its legitimate egress. (#69)
+
 ## [1.7.0] — 2026-10-10
 
 ### Added
