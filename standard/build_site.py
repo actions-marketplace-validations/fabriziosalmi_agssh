@@ -299,6 +299,27 @@ def build():
     pdf_src = os.path.join(_here, PDF_NAME)
     if os.path.exists(pdf_src):
         shutil.copy2(pdf_src, os.path.join(_site, PDF_NAME))
+    # sitemap. The site is one page and the standard's PDF, so this is a short
+    # file — but the PDF is the document people are meant to find, and nothing links to
+    # it from outside. Generated here, never hand-written, so it cannot drift from what
+    # build() actually wrote.
+    #
+    # NO robots.txt is written on purpose. Until 04/09/2026 Cloudflare served one for
+    # agssh.dev on its own — the content-signals notice, with the express reservation of
+    # rights under Article 4 of EU Directive 2019/790. That default is served ONLY while
+    # the origin has no robots.txt of its own: publishing one here silently replaced the
+    # notice with four lines (measured). The sitemap is declared in Search Console instead.
+    pagine = ["", PDF_NAME] if os.path.exists(os.path.join(_site, PDF_NAME)) else [""]
+    loc = "\n".join('  <url><loc>https://agssh.dev/%s</loc></url>' % x for x in pagine)
+    with open(os.path.join(_site, "sitemap.xml"), "w") as f:
+        # The sitemap namespace is an IDENTIFIER, not a link: sitemaps.org defines it as
+        # http://, and a validator comparing the string rejects https://. VBC-034 reads it
+        # as an insecure link, which is the one case where it is not one.
+        # slopless-disable-next-line VBC-034
+        ns = "http://www.sitemaps.org/schemas/sitemap/0.9"
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<urlset xmlns="%s">\n' % ns
+                + loc + "\n</urlset>\n")
     # A CNAME so GitHub Pages serves the apex domain.
     with open(os.path.join(_site, "CNAME"), "w") as f:
         f.write("agssh.dev\n")

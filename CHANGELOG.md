@@ -6,6 +6,61 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-10-10
+
+### Changed (verdict-affecting)
+
+- **The per-level obligations RULES.md documents are now enforced (#71).** Until now
+  the runner honoured level scope for AG-PRV-01 alone; every other `SHOULD · Lx` /
+  "not listed at Lx" / "forbidden · Lx" note in the standard was documentation. The
+  per-level behaviour is now derived from each rule's `applies` string by
+  `standard/build_pdf.py` into `internal/rules/levels_gen.go` (and a `levels:` field in
+  `manifest.yaml`, checked by a skew test), so spec and runner cannot drift:
+  - **Out of scope** (kept as bonus credit if passed, excused if not — RUN-06
+    monotonic scoring): AG-NET-05 at L2; AG-NET-08 and AG-GOV-06 at L2.
+  - **Advisory** (reported as `SHOULD`: still failing and scored, but covered by a
+    governed waiver): AG-NET-05 at L1; AG-NET-06, AG-CSP-06, AG-PRV-04 at L2.
+  - **Forbidden**: AG-PRV-06 fails any cross-origin iframe at L0/L1, sandboxed or not;
+    at L2 it demands the sandbox as before.
+  - A waiver is judged against the obligation in force **at the evaluated level**
+    (AG-GOV-01): AG-CSP-06 is waivable at L2, still a non-waivable MUST at L0/L1.
+  - Effect: L1/L2 surfaces stop being penalised for rules the standard does not demand
+    at their level; badge percentages for L1/L2 surfaces can rise. L0 is unchanged.
+  - AG-PRV-02's wording is now `MUST · L0 L1 L2 (decisive at L2)` (it was always
+    evaluated at every level).
+
+### Fixed
+
+- **AG-NET-05 now honours the declared egress allow-list.** Hosts in
+  `allow.connect` and `allow.subresources` (from L1) and `allow.embeds` (from L2) are
+  no longer reported as third-party egress; matching is exact-host, and a sibling
+  subdomain of the surface still has to be declared (consistent with AG-NET-02).
+  L0 still allows nothing. Previously only the exact surface host was exempt, so a
+  surface could not make the rule pass by declaring its legitimate egress. (#69)
+
+## [1.7.0] — 2026-10-10
+
+### Added
+
+- **`agssh scan <url>...`** — config-free CLI scan. Synthesizes the manifest from
+  flags (`-profile -level -kind -stateless -allow-connect -allow-subresource
+  -allow-embed -allow-storage -path -zone -resolver -timeout`), accepts several URLs
+  with flags and URLs interleaved, prints the human summary (or `-json` on stdout,
+  summary on stderr), and keeps the runner's exit codes (0/1/2/3). Source-plane rules
+  stay INCONCLUSIVE unless `-repo/-dist/-workflows` are given, never scanning the
+  current directory by accident. Parity with the MCP `agssh_scan` tool.
+- **Homebrew tap** — `brew install fabriziosalmi/agssh/agssh` (formula published by
+  goreleaser to `fabriziosalmi/homebrew-agssh`; installs `agssh` and `agssh-mcp`).
+  The upload skips itself until the `HOMEBREW_TAP_TOKEN` secret exists.
+- **Scheduled regression watch** — `examples/watch.yml` + `examples/watch-targets.json`.
+
+### Changed
+
+- URL normalization and zone derivation moved to `internal/target`, shared by the
+  CLI and the MCP server (no behaviour change).
+- CI `goreleaser check` tolerates only the soft `brews` deprecation; any other
+  configuration error still fails it.
+
 ## [1.6.0] — 2026-08-28
 
 ### Added

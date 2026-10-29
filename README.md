@@ -1,13 +1,13 @@
-# agssh — Air-Gapped Static Surface Hardening
+# Air-Gapped Static Surface Hardening (agssh)
 
-**Prove your static site makes zero unexpected network calls — deterministically, on every push.**
+**Prove your static site makes zero unexpected network calls deterministically, on every push.**
 
-A *surface* — a client-side tool, a docs site, a marketing page — should talk only
+A *surface*, a client-side tool, a docs site, a marketing page should talk only
 to its own origin. But nothing stops a CDN font, a stray analytics beacon, or a
 wide-open CSP from quietly turning the browser into a data-exfiltration path.
 **AGSSH-STD-001** (the Air-Gapped Static Surface Hardening standard) pins that
 property down, and **`agssh`** is the deterministic, fail-closed runner that
-enforces it — against the *live* deployment, not a promise. Built for teams
+enforces it against the *live* deployment, not a promise. Built for teams
 shipping static or client-side surfaces where privacy and supply-chain integrity
 *are* the product.
 
@@ -18,22 +18,28 @@ shipping static or client-side surfaces where privacy and supply-chain integrity
 
 ## Quick start
 
-Point it at a live URL and read the verdict — no config file to write, no build
-step, just pass the target inline (needs a Go toolchain; for a no-Go path use the
-Action or the `ghcr.io/fabriziosalmi/agssh` image):
+Point it at a live URL and read the verdict; no config file, no build step:
 
 ```bash
-go install github.com/fabriziosalmi/agssh/cmd/agssh@latest
-agssh -config <(echo 'target_profile: Bronze
-level: L0
-surfaces: [{url: "https://your-surface.example/", kind: site, stateless: true}]')
+brew install fabriziosalmi/agssh/agssh        # or: go install github.com/fabriziosalmi/agssh/cmd/agssh@latest
+agssh scan https://your-surface.example/
+agssh scan -profile Silver -level L1 -allow-connect https://api.example.com https://your-surface.example/
+agssh scan -json https://your-surface.example/ | jq '.score.pct'   # machine-readable; summary on stderr
 ```
 
-You get a verdict, then a severity-ranked queue of what to fix — and, kept separate,
+`agssh scan` takes any number of URLs (flags and URLs may be interleaved) and exits
+`0` conformant · `1` non-conformant · `2` usage error · `3` unscannable, so it drops
+straight into a shell script or CI step. Source-plane rules (secrets, vulnerable
+deps, SBOM, CI) stay `INCONCLUSIVE` unless you add `-repo`, `-dist`, `-workflows`.
+For a declared, versioned manifest use `agssh -config .airgap.yml` instead (below).
+No Go and no Homebrew? Use the Action or the `ghcr.io/fabriziosalmi/agssh` image:
+`docker run --rm ghcr.io/fabriziosalmi/agssh scan https://your-surface.example/`.
+
+You get a verdict, then a severity-ranked queue of what to fix and, kept separate,
 what could not be checked (fail-closed, never a silent pass):
 
 ```text
-AGSSH-STD-001 v1.6.0 — https://example.com/ @ Bronze/L0
+AGSSH-STD-001 v1.8.0 — https://example.com/ @ Bronze/L0
 Verdict: NON-CONFORMANT   Score: 42/86 (49%)
 Rules: 7 PASS · 8 FAIL · 1 INCONCLUSIVE · 0 waived · 0 N/A
 
@@ -63,11 +69,11 @@ go install github.com/fabriziosalmi/agssh/cmd/agssh-mcp@latest
 claude mcp add agssh -- agssh-mcp        # then: "scan https://example.com with agssh"
 ```
 
-Three ways in, one idea: **nothing is green unless proven.**
+Four ways in (CLI, Action, container, MCP), one idea: **nothing is green unless proven.**
 
 ## The standard
 
-<!-- agssh:std-headline -->[`standard/AGSSH-STD-001-v1.6.0.pdf`](standard/AGSSH-STD-001-v1.6.0.pdf) — 57 rules across 9 families<!-- /agssh:std-headline -->,
+<!-- agssh:std-headline -->[`standard/AGSSH-STD-001-v1.8.0.pdf`](./standard/AGSSH-STD-001-v1.8.0.pdf) — 57 rules across 9 families<!-- /agssh:std-headline -->,
 browsable as [**`RULES.md`**](RULES.md). The rules live as structured data in
 [`standard/build_pdf.py`](standard/build_pdf.py), which emits the PDF, `RULES.md`,
 **and** the runner's rule manifest from one source — so the document and the runner
@@ -167,6 +173,14 @@ Runs from a prebuilt image (`ghcr.io/fabriziosalmi/agssh`), so no per-run rebuil
 
 Outputs: `conformant` (`"true"`/`"false"`) and `report` (path to the JSON record).
 A ready-to-adapt workflow is in [`examples/workflow.yml`](examples/workflow.yml).
+
+## Watching surfaces over time
+
+[`examples/watch.yml`](examples/watch.yml) is a scheduled workflow that scans a list
+of surfaces ([`examples/watch-targets.json`](examples/watch-targets.json)) and opens
+one issue when any drops below its `min_score` floor or stops being reachable, then
+closes it when they recover. The floor is a ratchet: a still-non-conformant surface
+can be tracked and only alerts when it gets *worse*.
 
 ## As an MCP server
 
